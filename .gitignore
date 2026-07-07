@@ -1,0 +1,11 @@
+# runtime artifacts
+dng-libs/
+.immich-dng-cache/
+*.log
+
+# local dev harness and notes, not part of the published tool
+builder/
+upstream/
+apply/
+THREAD_POST.md
+.DS_Store
