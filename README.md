@@ -149,9 +149,12 @@ exercised deliberately. Full write-up with method and results in
 ## Credits
 
 - **[PseudoResonance](https://github.com/PseudoResonance)** did the hard part:
-  the proof-of-concept DNG SDK integration into immich-base-images (the libraw
-  patch, the libdng/XMP build recipes) that this tool packages and automates.
-  See [their branch](https://github.com/PseudoResonance/immich-base-images/tree/dng).
+  the libraw host-creation patch and the libdng/XMP build recipes (see
+  [their base-images branch](https://github.com/PseudoResonance/immich-base-images/tree/dng)
+  and [immich-dng-images](https://github.com/PseudoResonance/immich-dng-images),
+  their custom-image workflow), plus proposing the runtime-mount approach this
+  tool implements. This project packages and automates their work; the ideas are
+  theirs.
 - The **[Immich](https://github.com/immich-app/immich)** team, whose clean,
   pinned [base-images](https://github.com/immich-app/base-images) build system
   makes an ABI-exact local rebuild possible at all.
