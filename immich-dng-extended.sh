@@ -34,7 +34,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.1.1"
 SERVICE="${IMMICH_DNG_SERVICE:-immich-server}"
 LIB_DIR="dng-libs"
 OVERRIDE_FILE="docker-compose.override.yml"
@@ -94,6 +94,13 @@ resolve_base_ref() {
   log "Immich $IMMICH_VER was built from base-images tag $BASE_REF"
 }
 
+require_buildkit() {
+  [ "${DOCKER_BUILDKIT:-1}" != "0" ] \
+    || die "Docker BuildKit is disabled (DOCKER_BUILDKIT=0). Unset it or set it to 1."
+  docker buildx version >/dev/null 2>&1 \
+    || die "Docker Buildx/BuildKit is required. Make sure 'docker buildx version' works in the current Docker configuration (including any DOCKER_CONFIG override)."
+}
+
 # ---------------------------------------------------------------- manifest
 
 manifest_get() { [ -f "$MANIFEST" ] && sed -nE "s/^$1=//p" "$MANIFEST" || true; }
@@ -131,6 +138,7 @@ EOF
 }
 
 build_overlay() {
+  require_buildkit
   confirm_eula
   log "Fetching immich-app/base-images @ $BASE_REF"
   rm -rf "$CACHE_DIR/src"
@@ -149,7 +157,7 @@ build_overlay() {
   log "expect 10-40 minutes depending on your hardware. You will see a lot of"
   log "compiler output below — that is normal. Re-builds are much faster (cache)."
   local t0=$SECONDS
-  docker build --target libraw -t "immich-dng-build:${BASE_REF}" "$ctx"
+  docker buildx build --load --target libraw -t "immich-dng-build:${BASE_REF}" "$ctx"
   log "Build finished in $(( (SECONDS - t0) / 60 ))m $(( (SECONDS - t0) % 60 ))s."
 
   log "Extracting the patched libraw"

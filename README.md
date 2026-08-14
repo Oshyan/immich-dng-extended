@@ -4,7 +4,7 @@ Extend [Immich](https://immich.app)'s DNG support to the files stock Immich can'
 
 **One script. No Immich fork, no custom image, nothing redistributed, instant rollback, survives Immich updates.**
 
-> **Status: early release (beta).** This works, but so far it has been verified on exactly one instance: Immich v3.0.1, arm64, Docker on macOS. The design is conservative and the rollback paths are tested (see [Safety](#the-key-facts-up-front)), but treat it accordingly. If you try it, please [open an issue](../../issues) to report success *or* failure, including your architecture, host OS, and Immich version — every report helps. PRs are very welcome.
+> **Status: early release (beta).** This has been verified on one arm64 Docker-on-macOS instance across Immich v3.0.1 and v3.1.0. The design is conservative and the rollback paths are tested (see [Safety](#the-key-facts-up-front)), but treat it accordingly. If you try it, please [open an issue](../../issues) to report success *or* failure, including your architecture, host OS, and Immich version — every report helps. PRs are very welcome.
 
 ```sh
 cd /path/to/your/immich    # the folder containing docker-compose.yml
@@ -29,6 +29,7 @@ Not affiliated with Immich/FUTO or Adobe.
 
 - Immich running via **docker compose** (the standard install)
 - `bash`, `curl`, and docker with the compose plugin (or `docker-compose`)
+- Docker BuildKit/buildx; `docker buildx version` must work in the same Docker configuration used to run this script
 - No compilers or dev tools on the host; the build runs inside Docker
 - Should work on amd64 and arm64, since the build runs on your machine and always matches your architecture — but see the status note above; only arm64 is verified so far
 
@@ -75,6 +76,7 @@ Your Immich install, library, and database are never touched by any of this.
 - **`status` says STALE**: Immich was updated; run `apply` to rebuild.
 - **`status` says BROKEN or the container is restarting**: run `remove` to get back to stock immediately, then `apply` to rebuild from scratch.
 - **You already have a `docker-compose.override.yml`**: the script refuses to touch it and prints the two stanzas to merge by hand.
+- **The script says Buildx/BuildKit is required**: make sure `docker buildx version` works. If you set `DOCKER_CONFIG`, its `cli-plugins` directory must also expose the buildx plugin. Also make sure `DOCKER_BUILDKIT` is not set to `0`.
 - **Build fails**: nothing was changed on your server; the failure is contained to the build. Please [open an issue](../../issues) with the output.
 - **Non-standard service name**: set `IMMICH_DNG_SERVICE=<name>` if your compose service isn't called `immich-server`.
 
@@ -82,7 +84,12 @@ Something not covered here, or something worked/failed in an interesting way? [I
 
 ## Testing so far
 
-Verified end to end on one instance, Immich v3.0.1 (arm64, Docker on macOS): Lightroom HDR and pano DNGs that stock Immich rejects render correctly with the overlay; a control ARW renders byte-identically before and after; and the corruption/auto-rollback path was exercised deliberately. Full write-up with method and results in [PROOF.md](PROOF.md). Reports from other setups, successful or not, are the main thing this project needs right now.
+Verified end to end on one arm64 Docker-on-macOS instance:
+
+- **Immich v3.0.1:** Lightroom HDR and panorama DNGs that stock Immich rejects rendered correctly with the overlay; a control ARW rendered byte-identically before and after; and the corruption/auto-rollback path was exercised deliberately. Full write-up with method and results in [PROOF.md](PROOF.md).
+- **Immich v3.1.0:** the overlay rebuilt against base-images tag `202607211135`, activated successfully, passed its API/linkage/image-pipeline checks, and decoded the same Lightroom panorama DNG through Immich's Sharp/libvips pipeline to a 1440x356 JPEG.
+
+Reports from other setups, successful or not, are the main thing this project needs right now.
 
 ## Credits
 
