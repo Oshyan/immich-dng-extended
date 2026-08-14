@@ -34,7 +34,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.1.2"
+SCRIPT_VERSION="0.1.3"
 SERVICE="${IMMICH_DNG_SERVICE:-immich-server}"
 LIB_DIR="dng-libs"
 OVERRIDE_FILE="docker-compose.override.yml"
@@ -126,7 +126,7 @@ EOF
 
 libs_current() {
   ls "$LIB_DIR"/libraw_r.so.* >/dev/null 2>&1 || return 1
-  [ "$(manifest_get image_id)" = "$IMAGE_ID" ]
+  [ "$(manifest_get image_id)" = "$IMAGE_ID" ] || return 1
   local built_platform
   built_platform=$(manifest_get target_platform)
   [ -z "$built_platform" ] || [ "$built_platform" = "$TARGET_PLATFORM" ]
@@ -669,22 +669,28 @@ cmd_rebuild() {
 
 # ---------------------------------------------------------------- main
 
-CMD="${1:-apply}"
-[ $# -gt 0 ] && shift
-for a in "$@"; do
-  case "$a" in
-    -y|--yes) ASSUME_YES=1 ;;
-    *) die "Unknown option: $a" ;;
-  esac
-done
+main() {
+  local cmd="${1:-apply}"
+  [ $# -gt 0 ] && shift
+  for a in "$@"; do
+    case "$a" in
+      -y|--yes) ASSUME_YES=1 ;;
+      *) die "Unknown option: $a" ;;
+    esac
+  done
 
-case "$CMD" in
-  apply)   cmd_apply ;;
-  remove)  cmd_remove ;;
-  status)  cmd_status ;;
-  rebuild) cmd_rebuild ;;
-  -h|--help|help)
-    sed -n '3,33p' "$0" | sed 's/^# \{0,1\}//'
-    ;;
-  *) die "Unknown command '$CMD'. Use: apply | remove | status | rebuild" ;;
-esac
+  case "$cmd" in
+    apply)   cmd_apply ;;
+    remove)  cmd_remove ;;
+    status)  cmd_status ;;
+    rebuild) cmd_rebuild ;;
+    -h|--help|help)
+      sed -n '3,33p' "$0" | sed 's/^# \{0,1\}//'
+      ;;
+    *) die "Unknown command '$cmd'. Use: apply | remove | status | rebuild" ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
