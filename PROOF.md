@@ -1,3 +1,22 @@
+# Immich v3.1.0 compatibility recheck (2026-08-13)
+
+Target: `immich-server:v3.1.0` (arm64, OrbStack Docker on macOS), built from
+`immich-app/base-images` tag `202607211135`.
+
+The existing v3.0.1 overlay was removed before the Immich update, then rebuilt
+from the v3.1.0-pinned base-images recipe and reapplied. After activation:
+
+- the container was healthy with restart count `0`;
+- `ldd /usr/local/lib/libvips.so.42` resolved `libraw_r.so.25` to
+  `/opt/dng/lib/libraw_r.so.25`;
+- the API and built-in Sharp image-pipeline checks passed; and
+- the same Lightroom panorama `IMGP3836-Pano.dng` decoded through Sharp/libvips
+  to a 1440x356 JPEG (34,951 bytes).
+
+This was a compatibility recheck of the known-good DNG, not a repeat of every
+stock-versus-overlay control below. It confirms the overlay build, linkage, and
+problem-DNG decode path on v3.1.0.
+
 # Stage 1 proof (2026-07-07)
 
 Target: stock `immich-server:v3.0.1` (arm64, OrbStack Docker on macOS), built from
