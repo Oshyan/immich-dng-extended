@@ -34,7 +34,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.1.1"
+SCRIPT_VERSION="0.1.2"
 SERVICE="${IMMICH_DNG_SERVICE:-immich-server}"
 LIB_DIR="dng-libs"
 OVERRIDE_FILE="docker-compose.override.yml"
@@ -77,9 +77,16 @@ detect_immich() {
   [ -n "$CID" ] || die "Service '$SERVICE' is not running. Start Immich first (docker compose up -d)."
   IMMICH_VER=$(docker inspect "$CID" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')
   IMAGE_ID=$(docker inspect "$CID" --format '{{.Image}}')
+  TARGET_PLATFORM=$(docker image inspect "$IMAGE_ID" \
+    --format '{{.Os}}/{{.Architecture}}{{if .Variant}}/{{.Variant}}{{end}}') \
+    || die "Could not inspect the running Immich image platform."
   case "$IMMICH_VER" in
     v[0-9]*) ;;
     *) die "Could not detect the Immich version from the container's image labels (got '$IMMICH_VER')." ;;
+  esac
+  case "$TARGET_PLATFORM" in
+    */*) ;;
+    *) die "Could not detect the running Immich image platform (got '$TARGET_PLATFORM')." ;;
   esac
 }
 
@@ -109,6 +116,7 @@ manifest_write() {
   cat > "$MANIFEST" <<EOF
 image_id=$IMAGE_ID
 immich_version=$IMMICH_VER
+target_platform=$TARGET_PLATFORM
 base_ref=$BASE_REF
 dng_sdk=${LIBDNG_VERSION}_${LIBDNG_REVISION}
 script_version=$SCRIPT_VERSION
@@ -119,6 +127,9 @@ EOF
 libs_current() {
   ls "$LIB_DIR"/libraw_r.so.* >/dev/null 2>&1 || return 1
   [ "$(manifest_get image_id)" = "$IMAGE_ID" ]
+  local built_platform
+  built_platform=$(manifest_get target_platform)
+  [ -z "$built_platform" ] || [ "$built_platform" = "$TARGET_PLATFORM" ]
 }
 
 # ---------------------------------------------------------------- build
@@ -153,11 +164,13 @@ build_overlay() {
   patch_dockerfile "$ctx/Dockerfile"
 
   log "Building the patched libraw in Docker (target: libraw)."
+  log "Target platform: $TARGET_PLATFORM (from the running Immich image)."
   log "The FIRST build compiles libjxl + the Adobe DNG SDK + libraw from source:"
   log "expect 10-40 minutes depending on your hardware. You will see a lot of"
   log "compiler output below — that is normal. Re-builds are much faster (cache)."
   local t0=$SECONDS
-  docker buildx build --load --target libraw -t "immich-dng-build:${BASE_REF}" "$ctx"
+  docker buildx build --platform "$TARGET_PLATFORM" --load --target libraw \
+    -t "immich-dng-build:${BASE_REF}" "$ctx"
   log "Build finished in $(( (SECONDS - t0) / 60 ))m $(( (SECONDS - t0) % 60 ))s."
 
   log "Extracting the patched libraw"
@@ -612,6 +625,7 @@ cmd_status() {
   detect_compose
   detect_immich
   echo "Immich version:   $IMMICH_VER"
+  echo "Image platform:   $TARGET_PLATFORM"
   echo "Image id:         $(printf '%s' "${IMAGE_ID#sha256:}" | cut -c1-12)"
   if [ -f "$MANIFEST" ]; then
     echo "Libs built for:   $(manifest_get immich_version) (base-images $(manifest_get base_ref), DNG SDK $(manifest_get dng_sdk))"
