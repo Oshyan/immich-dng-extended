@@ -516,7 +516,7 @@ overlay_active() {
   # Match only the "=> /opt/dng/lib/..." resolution form; ldd ERROR lines for a
   # corrupt library also contain the path and must not count as active.
   docker exec "$cid" sh -c '
-    f=$(find /usr/src/app -name "sharp-linux-*.node" -path "*Release*" 2>/dev/null | head -1)
+    f=$(find /usr/src/app/server -name "sharp-linux-*.node" -path "*Release*" 2>/dev/null | head -1)
     [ -n "$f" ] && ldd "$f" 2>/dev/null | grep -qE "libraw_r\.so[^ ]* => /opt/dng/lib/"
   ' 2>/dev/null
 }
