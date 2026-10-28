@@ -8,7 +8,8 @@
 # It builds a DNG-SDK-enabled libraw ON YOUR MACHINE (Adobe's SDK is downloaded
 # from Adobe, never redistributed) and overlays it onto the stock immich-server
 # container via LD_LIBRARY_PATH. The stock image is never modified; removal is
-# instant and Immich updates keep working (re-run `apply` after updating).
+# instant and Immich updates keep working (run `update`, or `ensure` from
+# cron/systemd, after a new image is pulled).
 #
 # Usage: put this script next to your Immich docker-compose.yml, then:
 #
@@ -16,14 +17,19 @@
 #   ./immich-dng-extended.sh status   # show what's active / whether rebuild is due
 #   ./immich-dng-extended.sh remove   # back to 100% stock (keeps built libs)
 #   ./immich-dng-extended.sh rebuild  # force a rebuild (e.g. after Immich update)
+#   ./immich-dng-extended.sh update   # pull new image, rebuild if needed, activate
+#   ./immich-dng-extended.sh ensure   # automation-safe apply (cron/systemd/Watchtower)
 #
 # Options: -y / --yes  accept the Adobe DNG SDK license prompt non-interactively
+#          --auto      alias for automation mode (implies --yes if EULA already
+#                      accepted; never prompts, exits 2 if acceptance is missing)
 #
 # Requirements: bash, docker (with compose), curl. The build itself runs in
 # Docker, so no compilers are needed on the host. First build takes ~10-40 min.
 #
-# Safety: the build never touches the running server — it only writes files
-# next to this script. Activation is a single container recreate, after which
+# Safety: the build never touches the running server — it stages into
+# dng-libs.new/ and swaps atomically. Activation is a single container
+# recreate, after which
 # the script health-checks Immich (API up + image pipeline works); if anything
 # fails it automatically rolls back to the stock configuration. 'remove' or
 # deleting docker-compose.override.yml returns you to 100% stock at any time.
@@ -34,13 +40,21 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.1.3"
+SCRIPT_VERSION="0.2.0"
 SERVICE="${IMMICH_DNG_SERVICE:-immich-server}"
 LIB_DIR="dng-libs"
+LIB_STAGE_DIR="${LIB_DIR}.new"
+LIB_BACKUP_DIR="${LIB_DIR}.bak"
 OVERRIDE_FILE="docker-compose.override.yml"
 MARKER="managed by immich-dng-extended"
 CACHE_DIR="${IMMICH_DNG_CACHE:-.immich-dng-cache}"
 MANIFEST="$LIB_DIR/.immich-dng-manifest"
+LOCK_FILE="$CACHE_DIR/.immich-dng.lock"
+# EULA acceptance is persisted here (plus $XDG_CONFIG_HOME copy, see below) so
+# unattended runs (cron/systemd/Watchtower hooks) never have to re-prompt.
+EULA_ACCEPT_FILE="$CACHE_DIR/eula-accepted"
+_EULA_XDG_BASE="${XDG_CONFIG_HOME:-${HOME:-/tmp}/.config}"
+EULA_ACCEPT_XDG="$_EULA_XDG_BASE/immich-dng-extended/eula-accepted"
 ADOBE_EULA_URL="https://helpx.adobe.com/camera-raw/digital-negative.html"
 
 # Pinned Adobe DNG SDK + XMP toolkit (what the patched libraw is built against)
@@ -50,6 +64,8 @@ LIBXMP_REVISION="581c41213ddcee1fbc72cbb532531102a6617a25"
 
 COMPOSE_CMD=()
 ASSUME_YES=0
+AUTO=0
+if [ "${IMMICH_DNG_ASSUME_YES:-0}" = 1 ]; then ASSUME_YES=1; fi
 
 log()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
@@ -112,8 +128,10 @@ require_buildkit() {
 
 manifest_get() { [ -f "$MANIFEST" ] && sed -nE "s/^$1=//p" "$MANIFEST" || true; }
 
-manifest_write() {
-  cat > "$MANIFEST" <<EOF
+manifest_write_to() {
+  local dest="$1"
+  mkdir -p "$(dirname "$dest")"
+  cat > "$dest" <<EOF
 image_id=$IMAGE_ID
 immich_version=$IMMICH_VER
 target_platform=$TARGET_PLATFORM
@@ -124,6 +142,8 @@ built_at=$(date +%Y-%m-%dT%H:%M:%S%z)
 EOF
 }
 
+manifest_write() { manifest_write_to "$MANIFEST"; }
+
 libs_current() {
   ls "$LIB_DIR"/libraw_r.so.* >/dev/null 2>&1 || return 1
   [ "$(manifest_get image_id)" = "$IMAGE_ID" ] || return 1
@@ -132,10 +152,50 @@ libs_current() {
   [ -z "$built_platform" ] || [ "$built_platform" = "$TARGET_PLATFORM" ]
 }
 
+# ---------------------------------------------------------------- eula + locking
+
+# EULA acceptance is a local-machine fact (SDK downloaded for your own use),
+# so it persists across Immich updates. Checked by automation entry points.
+eula_accepted() {
+  local sdk="dng_sdk=${LIBDNG_VERSION}_${LIBDNG_REVISION}"
+  [ -f "$EULA_ACCEPT_FILE" ] && grep -qxF "$sdk" "$EULA_ACCEPT_FILE" 2>/dev/null && return 0
+  [ -f "$EULA_ACCEPT_XDG" ] && grep -qxF "$sdk" "$EULA_ACCEPT_XDG" 2>/dev/null && return 0
+  return 1
+}
+
+eula_mark_accepted() {
+  local sdk="dng_sdk=${LIBDNG_VERSION}_${LIBDNG_REVISION}"
+  mkdir -p "$CACHE_DIR"
+  printf '%s\n' "$sdk" > "$EULA_ACCEPT_FILE"
+  local xdg_dir
+  xdg_dir=$(dirname "$EULA_ACCEPT_XDG")
+  if mkdir -p "$xdg_dir" 2>/dev/null; then
+    printf '%s\n' "$sdk" > "$EULA_ACCEPT_XDG" 2>/dev/null || true
+  fi
+}
+
+# Non-blocking lock so overlapping cron runs / parallel `update` + `ensure`
+# never run two 10-40 min builds at once. Exit code 3 = "another run active".
+with_lock_or_exit() {
+  mkdir -p "$CACHE_DIR"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || { warn "Another immich-dng-extended run is in progress; exiting."; exit 3; }
+  else
+    warn "flock not found; proceeding without a lock (install util-linux flock for safe cron use)."
+  fi
+}
+
 # ---------------------------------------------------------------- build
 
 confirm_eula() {
-  [ "$ASSUME_YES" = 1 ] && return 0
+  if [ "$ASSUME_YES" = 1 ]; then
+    eula_mark_accepted
+    return 0
+  fi
+  if eula_accepted; then
+    return 0
+  fi
   cat <<EOF
 
 The build downloads the Adobe DNG SDK ${LIBDNG_VERSION} from Adobe's official
@@ -143,9 +203,34 @@ server (download.adobe.com) onto YOUR machine, for YOUR use. Nothing of
 Adobe's is redistributed by this tool. By continuing, you accept Adobe's
 DNG SDK license terms: ${ADOBE_EULA_URL}
 
+Your acceptance is stored locally (see --help) so future updates don't re-prompt.
+
 EOF
   read -r -p "Continue? [y/N] " a || die "Aborted (non-interactive; use --yes)."
   case "$a" in y|Y|yes|YES) ;; *) die "Aborted." ;; esac
+  eula_mark_accepted
+}
+
+# Records a -y/--yes (or IMMICH_DNG_ASSUME_YES=1) acceptance immediately, so
+# even no-op runs (libs already current, no build) persist it for later
+# unattended rebuilds. Interactive runs persist via confirm_eula instead.
+record_assumed_eula() { if [ "$ASSUME_YES" = 1 ]; then eula_mark_accepted; fi }
+
+# Automation entry points must never block on a prompt (cron has no TTY).
+# Pass-through when acceptance was recorded earlier, hard fail otherwise.
+require_eula_noninteractive() {
+  if [ "$ASSUME_YES" = 1 ]; then
+    eula_mark_accepted
+    return 0
+  fi
+  eula_accepted && return 0
+  cat >&2 <<EOF
+Adobe DNG SDK license acceptance is required before any unattended build.
+Run once interactively: ./immich-dng-extended.sh apply
+(or re-run this command with -y/--yes to accept non-interactively).
+Acceptance is stored in $EULA_ACCEPT_FILE.
+EOF
+  exit 2
 }
 
 build_overlay() {
@@ -168,6 +253,7 @@ build_overlay() {
   log "The FIRST build compiles libjxl + the Adobe DNG SDK + libraw from source:"
   log "expect 10-40 minutes depending on your hardware. You will see a lot of"
   log "compiler output below — that is normal. Re-builds are much faster (cache)."
+  log "The running server is untouched during the build; libs swap in atomically."
   local t0=$SECONDS
   docker buildx build --platform "$TARGET_PLATFORM" --load --target libraw \
     -t "immich-dng-build:${BASE_REF}" "$ctx"
@@ -176,14 +262,22 @@ build_overlay() {
   log "Extracting the patched libraw"
   local bcid
   bcid=$(docker create "immich-dng-build:${BASE_REF}")
-  rm -rf "$CACHE_DIR/extract"
-  mkdir -p "$CACHE_DIR/extract" "$LIB_DIR"
+  rm -rf "$CACHE_DIR/extract" "$LIB_STAGE_DIR"
+  mkdir -p "$CACHE_DIR/extract" "$LIB_STAGE_DIR"
   docker cp "$bcid:/usr/local/lib/." "$CACHE_DIR/extract/"
   docker rm "$bcid" >/dev/null
-  find "$LIB_DIR" -maxdepth 1 -name 'libraw*' -exec rm -f {} +
-  cp -P "$CACHE_DIR/extract"/libraw.so* "$CACHE_DIR/extract"/libraw_r.so* "$LIB_DIR/"
+  cp -P "$CACHE_DIR/extract"/libraw.so* "$CACHE_DIR/extract"/libraw_r.so* "$LIB_STAGE_DIR/"
   rm -rf "$CACHE_DIR/src" "$CACHE_DIR/extract"
-  manifest_write
+  manifest_write_to "$LIB_STAGE_DIR/.immich-dng-manifest"
+  # Atomic swap: the live mount is either the full old set or the full new
+  # set — never half-copied. A container restart mid-swap sees one or the
+  # other, and rollback just re-points at stock.
+  if [ -d "$LIB_DIR" ]; then
+    rm -rf "$LIB_BACKUP_DIR"
+    mv "$LIB_DIR" "$LIB_BACKUP_DIR"
+  fi
+  mv "$LIB_STAGE_DIR" "$LIB_DIR"
+  rm -rf "$LIB_BACKUP_DIR" "$LIB_STAGE_DIR"
   log "Overlay libs ready in ./$LIB_DIR"
 }
 
@@ -571,6 +665,8 @@ rollback() {
 }
 
 cmd_apply() {
+  with_lock_or_exit
+  record_assumed_eula
   detect_compose
   detect_immich
   if libs_current; then
@@ -578,14 +674,22 @@ cmd_apply() {
     BASE_REF=$(manifest_get base_ref)
   else
     resolve_base_ref
-    # The build only produces files in ./$LIB_DIR — the running server is not
-    # touched until the build has fully succeeded.
+    # The build writes to ./$LIB_DIR atomically (via $LIB_STAGE_DIR) — the
+    # running server is not touched until the build has fully succeeded.
     build_overlay
   fi
+  activate_with_overlay
+  printf '\n\033[1;32m✔ SUCCESS\033[0m — immich-dng-extended is active.\n\n'
+  log "To backfill previously-failed files: Immich web -> Administration -> Jobs ->"
+  log "Generate Thumbnails -> Missing (and the same for Extract Metadata if needed)."
+  log "Instant rollback any time: ./immich-dng-extended.sh remove"
+}
+
+# Shared activate+verify path: prove the overlay WORKS (smoke test), not just
+# that it's configured — a library corrupted on disk after a past apply would
+# otherwise be reported healthy while the next restart crash-loops.
+activate_with_overlay() {
   get_image_ldp
-  # The fast path must prove the overlay WORKS (smoke test), not just that it's
-  # configured — a library corrupted on disk after a past apply would otherwise
-  # be reported healthy while the next container restart would crash-loop.
   if [ -f "$OVERRIDE_FILE" ] && grep -q "$MARKER" "$OVERRIDE_FILE" && libs_current && overlay_active && smoke_test; then
     write_override
     log "Overlay already active, verified working, and up to date. Nothing to do."
@@ -599,10 +703,102 @@ cmd_apply() {
     smoke_test || rollback
     log "Verified: Immich is up, healthy, and using the DNG-SDK-enabled libraw."
   fi
-  printf '\n\033[1;32m✔ SUCCESS\033[0m — immich-dng-extended is active.\n\n'
-  log "To backfill previously-failed files: Immich web -> Administration -> Jobs ->"
-  log "Generate Thumbnails -> Missing (and the same for Extract Metadata if needed)."
-  log "Instant rollback any time: ./immich-dng-extended.sh remove"
+}
+
+notify() {
+  if [ -n "${IMMICH_DNG_NOTIFY_CMD:-}" ]; then
+    # Best-effort hook for cron/systemd (e.g. mail, ntfy, webhook). Never fail the run.
+    sh -c "$IMMICH_DNG_NOTIFY_CMD" _ "$@" || warn "Notify command failed (ignored)."
+  fi
+}
+
+# Automation-safe apply: never prompts, takes a lock, exits 0 when healthy.
+# Exit codes: 0 = healthy (already current or rebuilt+verified),
+#             1 = failure (rolled back to stock, see logs),
+#             2 = EULA acceptance required (run `apply` once, or re-run with -y),
+#             3 = another run in progress.
+cmd_ensure() {
+  with_lock_or_exit
+  record_assumed_eula
+  detect_compose
+  detect_immich
+  if libs_current; then
+    BASE_REF=$(manifest_get base_ref)
+  else
+    require_eula_noninteractive
+    resolve_base_ref
+    build_overlay
+  fi
+  if ! (
+    activate_with_overlay
+  ); then
+    notify "immich-dng-extended ensure FAILED for $IMMICH_VER"
+    return 1
+  fi
+  if libs_current && overlay_active; then
+    log "ensure: healthy (immich $IMMICH_VER, overlay active)."
+    return 0
+  fi
+  return 1
+}
+
+# Pull the latest server image, deploy it, and re-apply the overlay if the
+# image changed. Safe to run unattended with -y/--auto after the first
+# interactive apply: the long build runs against a healthy stock server.
+cmd_update() {
+  local was_auto=0
+  [ "${AUTO:-0}" = 1 ] && was_auto=1
+  with_lock_or_exit
+  record_assumed_eula
+  detect_compose
+  if [ "$was_auto" = 1 ]; then
+    require_eula_noninteractive
+  fi
+  log "Pulling latest image for $SERVICE"
+  compose pull "$SERVICE" || die "docker compose pull failed."
+  log "Deploying the pulled image"
+  compose up -d "$SERVICE" || die "docker compose up failed."
+  detect_immich
+  if libs_current; then
+    log "Image unchanged or libs already match $IMMICH_VER — ensuring overlay."
+    BASE_REF=$(manifest_get base_ref)
+    if [ "$was_auto" = 1 ]; then
+      cmd_ensure_inner_no_lock
+    else
+      activate_with_overlay
+    fi
+  else
+    if [ "$was_auto" = 1 ]; then
+      require_eula_noninteractive
+    fi
+    resolve_base_ref
+    if [ -f "$OVERRIDE_FILE" ] && grep -q "$MARKER" "$OVERRIDE_FILE"; then
+      # Don't leave the server crash-looping on stale libs during a 10-40 min
+      # build: park it on stock first, then rebuild + re-activate.
+      log "Image changed — parking $SERVICE on stock during rebuild"
+      rm -f "$OVERRIDE_FILE"
+      compose up -d --force-recreate "$SERVICE" || die "Failed to start stock server."
+      wait_api || warn "Stock server slow to come up; continuing with build anyway."
+    fi
+    build_overlay
+    detect_immich
+    activate_with_overlay
+  fi
+  printf '\n\033[1;32m✔ SUCCESS\033[0m — immich-dng-extended is active'
+  printf ' on %s.\n' "$IMMICH_VER"
+  notify "immich-dng-extended update OK for $IMMICH_VER"
+}
+
+# Inner ensure without re-locking (called from cmd_update which holds the lock).
+cmd_ensure_inner_no_lock() {
+  if libs_current; then
+    BASE_REF=$(manifest_get base_ref)
+  else
+    require_eula_noninteractive
+    resolve_base_ref
+    build_overlay
+  fi
+  activate_with_overlay
 }
 
 cmd_remove() {
@@ -660,11 +856,13 @@ cmd_status() {
 }
 
 cmd_rebuild() {
+  with_lock_or_exit
   detect_compose
   detect_immich
   resolve_base_ref
   build_overlay
-  cmd_apply
+  activate_with_overlay
+  printf '\n\033[1;32m✔ SUCCESS\033[0m — immich-dng-extended is active.\n'
 }
 
 # ---------------------------------------------------------------- main
@@ -675,19 +873,44 @@ main() {
   for a in "$@"; do
     case "$a" in
       -y|--yes) ASSUME_YES=1 ;;
+      --auto) AUTO=1 ;;
       *) die "Unknown option: $a" ;;
     esac
   done
 
   case "$cmd" in
-    apply)   cmd_apply ;;
+    apply)
+      if [ "$AUTO" = 1 ]; then cmd_ensure; else cmd_apply; fi ;;
     remove)  cmd_remove ;;
     status)  cmd_status ;;
     rebuild) cmd_rebuild ;;
+    update)  cmd_update ;;
+    ensure)  cmd_ensure ;;
     -h|--help|help)
-      sed -n '3,33p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
+      cat <<EOF
+
+Commands:
+  apply     interactive apply (prompts for Adobe DNG SDK license once)
+  update    pull + redeploy + rebuild-if-stale + verify (use -y/--auto after first apply)
+  ensure    automation-safe apply for cron/systemd/Watchtower; never prompts
+            exits 0=healthy, 1=failed, 2=EULA acceptance needed, 3=another run active
+  status    show versions and health
+  remove    back to stock
+  rebuild   force rebuild
+
+Automation:
+  cron:      */15 * * * * cd /path/to/immich && ./immich-dng-extended.sh ensure >>dng-auto.log 2>&1
+  systemd:   timer calling 'ensure' with WorkingDirectory=/path/to/immich
+  Watchtower: use a post-update hook / notification to run 'ensure --auto'
+  notify:    set IMMICH_DNG_NOTIFY_CMD='ntfy publish mytopic ...' to run on update/failure
+
+EULA acceptance is recorded in $CACHE_DIR/eula-accepted (and per-user under
+\$XDG_CONFIG_HOME/immich-dng-extended/) so unattended runs don't re-prompt.
+Set IMMICH_DNG_ASSUME_YES=1 instead of passing -y in automation.
+EOF
       ;;
-    *) die "Unknown command '$cmd'. Use: apply | remove | status | rebuild" ;;
+    *) die "Unknown command '$cmd'. Use: apply | update | ensure | remove | status | rebuild" ;;
   esac
 }
 

@@ -37,13 +37,16 @@ Not affiliated with Immich/FUTO or Adobe.
 
 ```sh
 ./immich-dng-extended.sh apply     # detect, build if needed, activate, verify
+./immich-dng-extended.sh update    # pull latest image, rebuild if needed, activate
+./immich-dng-extended.sh ensure    # automation-safe apply (cron/systemd/Watchtower)
 ./immich-dng-extended.sh status    # what's running, what's built, what's needed
 ./immich-dng-extended.sh remove    # instant return to 100% stock
 ./immich-dng-extended.sh rebuild   # force a full rebuild
 ./immich-dng-extended.sh apply -y  # non-interactive (accepts the license prompt)
+./immich-dng-extended.sh ensure --auto  # same as ensure; never prompts
 ```
 
-`apply` walks through: detect your exact Immich version from the running container → look up which official build recipe that release used → ask you to accept Adobe's DNG SDK license → build → activate with one container restart → verify. It is idempotent: re-running when nothing changed does nothing.
+`apply` walks through: detect your exact Immich version from the running container → look up which official build recipe that release used → ask you to accept Adobe's DNG SDK license → build → activate with one container restart → verify. It is idempotent: re-running when nothing changed does nothing. Your license acceptance is stored locally (`.immich-dng-cache/eula-accepted`, plus a per-user copy), so later updates never re-prompt.
 
 ## After applying
 
@@ -51,7 +54,23 @@ Existing DNGs that previously failed won't fix themselves until Immich retries t
 
 ## After an Immich update
 
-Run `./immich-dng-extended.sh apply` again. It compares the running image against what the libraries were built for and rebuilds only if they actually differ; otherwise it's a no-op. Until you re-run it after a major update, the worst case is that DNG decoding reverts to stock behavior (the same files failing that failed before). If an update ever makes the overlay incompatible, `remove` gets you to stock instantly and the next `apply` rebuilds clean.
+Run `./immich-dng-extended.sh update` (or plain `apply`) after pulling a new image. It compares the running image against what the libraries were built for and rebuilds only if they actually differ. Until you re-run it after a major update, the worst case is that DNG decoding reverts to stock behavior (the same files failing that failed before). If an update ever makes the overlay incompatible, `remove` gets you to stock instantly and the next `apply` rebuilds clean.
+
+`update` pulls `immich-server`, redeploys, and — if the image changed — parks the server on stock while the (10-40 min) rebuild runs, then re-activates and verifies. The build stages into `dng-libs.new/` and swaps atomically, so a restart mid-build never sees a half-written library.
+
+## Automatic updates (cron / systemd / Watchtower)
+
+`ensure` is the automation-safe `apply`: it never prompts (exits `2` if the Adobe DNG SDK license was never accepted — run `apply` once interactively or pass `-y`), takes a lock so overlapping runs can't start two builds (exit `3` if another run holds it), and exits `0` when Immich is healthy with the overlay active, `1` on failure (already rolled back to stock).
+
+```sh
+# cron: check every 15 minutes (run once interactively first)
+*/15 * * * * cd /path/to/immich && ./immich-dng-extended.sh ensure >>dng-auto.log 2>&1
+
+# or non-interactive first acceptance (e.g. fresh host provisioning)
+./immich-dng-extended.sh ensure -y
+```
+
+systemd: a timer with `WorkingDirectory=/path/to/immich` calling `ensure`. Watchtower/Diun: point the post-update hook or notification at `ensure --auto`. Optional: set `IMMICH_DNG_NOTIFY_CMD` (e.g. an `ntfy` publish) to run on `update` success / `ensure` failure. `IMMICH_DNG_ASSUME_YES=1` works as a `-y` equivalent for automation, and `IMMICH_DNG_CACHE` / `IMMICH_DNG_SERVICE` keep working as before.
 
 ## Rollback / uninstall
 
@@ -73,7 +92,7 @@ Your Immich install, library, and database are never touched by any of this.
 
 ## Troubleshooting
 
-- **`status` says STALE**: Immich was updated; run `apply` to rebuild.
+- **`status` says STALE**: Immich was updated; run `update` (or `apply` / `ensure`) to rebuild.
 - **`status` says BROKEN or the container is restarting**: run `remove` to get back to stock immediately, then `apply` to rebuild from scratch.
 - **You already have a `docker-compose.override.yml`**: the script refuses to touch it and prints the two stanzas to merge by hand.
 - **The script says Buildx/BuildKit is required**: make sure `docker buildx version` works. If you set `DOCKER_CONFIG`, its `cli-plugins` directory must also expose the buildx plugin. Also make sure `DOCKER_BUILDKIT` is not set to `0`.
