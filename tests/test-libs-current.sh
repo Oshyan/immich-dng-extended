@@ -19,9 +19,13 @@ touch "$LIB_DIR/libraw_r.so.25"
 write_manifest() {
   local image_id="$1"
   local target_platform="${2:-}"
+  local build_revision="${3-$BUILD_REVISION}"
   printf 'image_id=%s\n' "$image_id" > "$MANIFEST"
   if [ -n "$target_platform" ]; then
     printf 'target_platform=%s\n' "$target_platform" >> "$MANIFEST"
+  fi
+  if [ -n "$build_revision" ]; then
+    printf 'build_revision=%s\n' "$build_revision" >> "$MANIFEST"
   fi
 }
 
@@ -42,10 +46,10 @@ assert_stale() {
 }
 
 write_manifest "$IMAGE_ID"
-assert_current "matching image with legacy manifest"
+assert_current "matching image and build revision"
 
 write_manifest "$IMAGE_ID" "$TARGET_PLATFORM"
-assert_current "matching image and platform"
+assert_current "matching image, platform, and build revision"
 
 write_manifest "sha256:old-image"
 assert_stale "changed image with legacy manifest"
@@ -55,6 +59,12 @@ assert_stale "changed image with matching platform"
 
 write_manifest "$IMAGE_ID" "linux/amd64"
 assert_stale "matching image with different platform"
+
+write_manifest "$IMAGE_ID" "$TARGET_PLATFORM" "1"
+assert_stale "matching image and platform with old build revision"
+
+write_manifest "$IMAGE_ID" "$TARGET_PLATFORM" ""
+assert_stale "legacy manifest without build revision"
 
 rm "$MANIFEST"
 assert_stale "missing manifest"

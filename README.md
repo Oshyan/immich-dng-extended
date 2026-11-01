@@ -43,7 +43,7 @@ Not affiliated with Immich/FUTO or Adobe.
 ./immich-dng-extended.sh apply -y  # non-interactive (accepts the license prompt)
 ```
 
-`apply` walks through: detect your exact Immich version from the running container → look up which official build recipe that release used → ask you to accept Adobe's DNG SDK license → build → activate with one container restart → verify. It is idempotent: re-running when nothing changed does nothing.
+`apply` walks through: detect your exact Immich version from the running container → look up which official build recipe that release used → ask you to accept Adobe's DNG SDK license → build → activate with one container restart → verify. It is idempotent: re-running when neither the Immich image nor the embedded build recipe has changed does nothing.
 
 ## After applying
 
@@ -51,7 +51,7 @@ Existing DNGs that previously failed won't fix themselves until Immich retries t
 
 ## After an Immich update
 
-Run `./immich-dng-extended.sh apply` again. It compares the running image against what the libraries were built for and rebuilds only if they actually differ; otherwise it's a no-op. Until you re-run it after a major update, the worst case is that DNG decoding reverts to stock behavior (the same files failing that failed before). If an update ever makes the overlay incompatible, `remove` gets you to stock instantly and the next `apply` rebuilds clean.
+Run `./immich-dng-extended.sh apply` again. It compares the running image, target platform, and embedded build revision against what the libraries were built for, and rebuilds only if they actually differ; otherwise it's a no-op. Until you re-run it after a major update, the worst case is that DNG decoding reverts to stock behavior (the same files failing that failed before). If an update ever makes the overlay incompatible, `remove` gets you to stock instantly and the next `apply` rebuilds clean. The same applies when you update this script: if it contains a newer build recipe, `apply` rebuilds automatically.
 
 ## Rollback / uninstall
 
@@ -67,7 +67,7 @@ Your Immich install, library, and database are never touched by any of this.
 
 1. **Version detection.** Reads `org.opencontainers.image.version` from your running `immich-server` container, so it works even if your compose file uses the `release` tag.
 2. **Recipe and platform matching.** Every Immich release is built from a pinned tag of [immich-app/base-images](https://github.com/immich-app/base-images), which pins the exact libraw/libjxl/libvips versions. The script reads that tag from the release's `server/Dockerfile` and downloads those exact recipes, so the overlay build uses the same base image and same library versions as your server. It also derives the target platform from the running Immich image and passes it explicitly to Buildx, so a remote builder on another architecture cannot silently produce incompatible libraries. ABI compatibility by construction, not by luck.
-3. **The DNG additions.** The Adobe DNG SDK and XMP toolkit are compiled as static libraries, and libraw is compiled against them with `USE_DNGSDK`, plus an 8-line patch that lazily creates a default `dng_host` inside libraw. That patch is the key insight (credit: PseudoResonance): because host creation lives inside libraw, consumers like libvips/sharp need **zero changes**.
+3. **The DNG additions.** The Adobe DNG SDK and XMP toolkit are compiled as static libraries, and libraw is compiled against them with `USE_DNGSDK`, plus a small patch that (a) lazily creates a default `dng_host` inside libraw and (b) enables the DNG SDK's stage 2/3 opcode processing for JPEG/JPEG-XL-compressed DNGs. The first part is the key insight (credit: PseudoResonance): because host creation lives inside libraw, consumers like libvips/sharp need **zero changes**. The second part fixes colors for JPEG-XL DNGs: without it libraw reads stage-1 raw data but skips `OpcodeList2` (for example `MapPolynomial`), then applies camera white balance to the un-mapped values, producing pink or otherwise wrong previews.
 4. **The overlay.** The only artifacts are patched `libraw.so` / `libraw_r.so` files (~18 MB each; the SDK is statically inside them). Immich's pipeline is sharp → libvips → `libraw_r`, and the dynamic linker picks up the patched copy via `LD_LIBRARY_PATH` before the stock one in `/usr/local/lib`. Remove the env var and the stock library is used again, untouched.
 5. **Verification.** `ldd` inside the container must show `libraw_r` resolving to `/opt/dng/lib/`, the API must answer, and a real image must survive the sharp pipeline. Any failure triggers automatic rollback and invalidates the build so the next `apply` starts clean.
 
@@ -88,6 +88,7 @@ Verified end to end on one arm64 Docker-on-macOS instance:
 
 - **Immich v3.0.1:** Lightroom HDR and panorama DNGs that stock Immich rejects rendered correctly with the overlay; a control ARW rendered byte-identically before and after; and the corruption/auto-rollback path was exercised deliberately. Full write-up with method and results in [PROOF.md](PROOF.md).
 - **Immich v3.1.0:** the overlay rebuilt against base-images tag `202607211135`, activated successfully, passed its API/linkage/image-pipeline checks, and decoded the same Lightroom panorama DNG through Immich's Sharp/libvips pipeline to a 1440x356 JPEG.
+- **Color correctness for JPEG-XL DNGs:** the stage 2/3 opcode fix was verified against libraw built locally with the same DNG SDK and settings libvips uses: the pre-fix build reproduced the bad pink preview, and the patched build matched the reference render.
 
 Reports from other setups, successful or not, are the main thing this project needs right now.
 
