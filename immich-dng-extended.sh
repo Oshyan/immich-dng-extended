@@ -34,7 +34,10 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.1.3"
+SCRIPT_VERSION="0.1.4"
+# Bump when anything that affects the built libraries changes (embedded build
+# recipes, patches, pinned SDK versions). Immich's image id cannot detect that.
+BUILD_REVISION="2"
 SERVICE="${IMMICH_DNG_SERVICE:-immich-server}"
 LIB_DIR="dng-libs"
 OVERRIDE_FILE="docker-compose.override.yml"
@@ -120,6 +123,7 @@ target_platform=$TARGET_PLATFORM
 base_ref=$BASE_REF
 dng_sdk=${LIBDNG_VERSION}_${LIBDNG_REVISION}
 script_version=$SCRIPT_VERSION
+build_revision=$BUILD_REVISION
 built_at=$(date +%Y-%m-%dT%H:%M:%S%z)
 EOF
 }
@@ -127,6 +131,7 @@ EOF
 libs_current() {
   ls "$LIB_DIR"/libraw_r.so.* >/dev/null 2>&1 || return 1
   [ "$(manifest_get image_id)" = "$IMAGE_ID" ] || return 1
+  [ "$(manifest_get build_revision)" = "$BUILD_REVISION" ] || return 1
   local built_platform
   built_platform=$(manifest_get target_platform)
   [ -z "$built_platform" ] || [ "$built_platform" = "$TARGET_PLATFORM" ]
@@ -378,12 +383,12 @@ diff --git a/src/decoders/unpack.cpp b/src/decoders/unpack.cpp
 index cb9e341e..9afd9d4b 100644
 --- a/src/decoders/unpack.cpp
 +++ b/src/decoders/unpack.cpp
-@@ -87,6 +87,8 @@ int LibRaw::unpack(void)
-     imgdata.rawdata.float3_image = 0;
-
+@@ -89,4 +89,8 @@ int LibRaw::unpack(void)
  #ifdef USE_DNGSDK
 +    if (!dnghost)
 +      create_dng_host();
++    // Apply OpcodeList2/3 for JPEG/JPEG-XL DNGs (needed for correct color).
++    imgdata.rawparams.options |= LIBRAW_RAWOPTIONS_DNG_STAGE23_IFPRESENT_JPGJXL;
      if (imgdata.idata.dng_version && dnghost
          && libraw_internal_data.unpacker_data.tiff_samples != 2  // Fuji SuperCCD; it is better to detect is more rigid way
          && valid_for_dngsdk() && load_raw != &LibRaw::pentax_4shot_load_raw)
@@ -629,10 +634,12 @@ cmd_status() {
   echo "Image id:         $(printf '%s' "${IMAGE_ID#sha256:}" | cut -c1-12)"
   if [ -f "$MANIFEST" ]; then
     echo "Libs built for:   $(manifest_get immich_version) (base-images $(manifest_get base_ref), DNG SDK $(manifest_get dng_sdk))"
-    if [ "$(manifest_get image_id)" = "$IMAGE_ID" ]; then
-      echo "Build freshness:  in sync with the running image"
-    else
+    if [ "$(manifest_get image_id)" != "$IMAGE_ID" ]; then
       echo "Build freshness:  STALE — Immich image changed; run './immich-dng-extended.sh apply' to rebuild"
+    elif [ "$(manifest_get build_revision)" != "$BUILD_REVISION" ]; then
+      echo "Build freshness:  STALE — overlay build recipe changed; run './immich-dng-extended.sh apply' to rebuild"
+    else
+      echo "Build freshness:  in sync with the running image"
     fi
   else
     echo "Libs built for:   (none built yet)"
